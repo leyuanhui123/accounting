@@ -1948,12 +1948,15 @@ function updateVoucherTotals() {
   const lines = getVoucherLines();
   const debit = lines.reduce((s,l)=>s+l.debit,0);
   const credit = lines.reduce((s,l)=>s+l.credit,0);
+  // 绝对值之和：用于判断是否有实际金额、借贷是否平衡（支持借方/贷方含负数的红字凭证）
+  const absDebit = lines.reduce((s,l)=>s+Math.abs(l.debit),0);
+  const absCredit = lines.reduce((s,l)=>s+Math.abs(l.credit),0);
   document.getElementById('vchr-debit-total').textContent = '¥'+fmt(debit);
   document.getElementById('vchr-credit-total').textContent = '¥'+fmt(credit);
-  document.getElementById('vchr-total-cn').textContent = numCN(debit);
-  const ok = Math.abs(debit-credit)<0.005 && debit>0;
+  document.getElementById('vchr-total-cn').textContent = numCN(absDebit);
+  const ok = Math.abs(absDebit-absCredit)<0.005 && absDebit>0;
   const el = document.getElementById('vchr-balance-check');
-  el.textContent = ok ? '✅ 借贷平衡' : `⚠️ 差额：${fmt(Math.abs(debit-credit))}`;
+  el.textContent = ok ? '✅ 借贷平衡' : `⚠️ 差额：${fmt(Math.abs(absDebit-absCredit))}`;
   el.className = 'balance-check ' + (ok?'balance-ok':'balance-err');
 }
 
@@ -1962,8 +1965,11 @@ function saveVoucher(status) {
   if (!lines.length) { showToast('⚠️ 请至少录入一条分录'); return; }
   const debit = lines.reduce((s,l)=>s+l.debit,0);
   const credit = lines.reduce((s,l)=>s+l.credit,0);
-  if (status==='posted' && Math.abs(debit-credit)>0.005) { showToast('⚠️ 借贷不平衡，无法过账'); return; }
-  if (status==='posted' && debit===0) { showToast('⚠️ 金额不能为零'); return; }
+  // 用绝对值之和判断，支持借方/贷方含负数的红字冲销凭证
+  const absDebit = lines.reduce((s,l)=>s+Math.abs(l.debit),0);
+  const absCredit = lines.reduce((s,l)=>s+Math.abs(l.credit),0);
+  if (status==='posted' && Math.abs(absDebit-absCredit)>0.005) { showToast('⚠️ 借贷不平衡，无法过账'); return; }
+  if (status==='posted' && absDebit===0) { showToast('⚠️ 金额不能为零'); return; }
   // 检查必须辅助核算的科目是否已填写
   for (const l of lines) {
     const subj = DB.subjects.find(s=>s.code===l.code);
@@ -2011,7 +2017,9 @@ function postVoucher(id) {
   if (!v) return;
   const debit = v.lines.reduce((s,l)=>s+(Number(l.debit)||0),0);
   const credit = v.lines.reduce((s,l)=>s+(Number(l.credit)||0),0);
-  if (Math.abs(debit-credit)>0.005) { showToast('⚠️ 借贷不平衡，无法过账'); return; }
+  const absDebit = v.lines.reduce((s,l)=>s+Math.abs(Number(l.debit)||0),0);
+  const absCredit = v.lines.reduce((s,l)=>s+Math.abs(Number(l.credit)||0),0);
+  if (Math.abs(absDebit-absCredit)>0.005) { showToast('⚠️ 借贷不平衡，无法过账'); return; }
   v.status = 'posted';
   saveDB(); renderVouchers(); showToast('✅ 凭证已过账');
 }
