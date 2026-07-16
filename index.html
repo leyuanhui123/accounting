@@ -481,10 +481,15 @@ async function syncCloud() {
                 <input type="text" class="form-control" id="cur-period-status" readonly>
               </div>
             </div>
+            <div class="form-group" style="margin-bottom:16px">
+              <label class="form-label">结账账期（可任选任意有凭证的期间）</label>
+              <select class="form-control" id="close-target-period"></select>
+              <small style="color:#6b7280">支持从启用账期（如 2026年02月）起逐月结账，无需先切回该账期。</small>
+            </div>
             <div id="period-steps"></div>
             <hr class="divider">
             <div class="btn-group">
-              <button class="btn btn-success" onclick="closePeriod()">🔒 结账并进入下一期</button>
+              <button class="btn btn-success" onclick="closePeriod(document.getElementById('close-target-period').value)">🔒 结账所选账期</button>
               <button class="btn btn-outline" onclick="renderPeriodPage()">🔄 刷新状态</button>
             </div>
           </div>
@@ -2069,6 +2074,18 @@ function renderPeriodPage() {
       </div>
     </div>
   `;
+  // 填充“结账账期”下拉框：列出所有有凭证的期间（含当前账期），已结账标灰仍可选（重结）
+  const sel = document.getElementById('close-target-period');
+  if (sel) {
+    const periods = Array.from(new Set(DB.vouchers.map(v=>v.period))).sort();
+    if (!periods.includes(DB.currentPeriod)) periods.push(DB.currentPeriod);
+    periods.sort();
+    const closedSet = new Set(DB.periods.filter(p=>p.closed).map(p=>p.period));
+    sel.innerHTML = periods.map(p=>{
+      const closed = closedSet.has(p);
+      return `<option value="${p}" ${p===DB.currentPeriod?'selected':''}>${periodLabel(p)}${closed?'（已结账）':''}</option>`;
+    }).join('');
+  }
   // History
   const tbody = document.getElementById('period-history');
   const closed = DB.periods.filter(p=>p.closed);
@@ -2100,15 +2117,17 @@ function isClosingVoucher(v) {
   });
 }
 
-function closePeriod() {
-  const draft = DB.vouchers.filter(v=>v.period===DB.currentPeriod&&v.status==='draft').length;
-  if (draft>0) { showToast('⚠️ 还有草稿凭证，请先全部过账再结账'); return; }
-  if (!confirm(`确认结账 ${periodLabel(DB.currentPeriod)}？结账后将进入下一账期。`)) return;
+function closePeriod(targetPeriod) {
+  // 支持指定任意账期结账（默认当前账期）；可从启用账期起逐月结账
+  const period = (targetPeriod && String(targetPeriod).trim()) ? String(targetPeriod) : DB.currentPeriod;
+  const draft = DB.vouchers.filter(v=>v.period===period&&v.status==='draft').length;
+  if (draft>0) { showToast('⚠️ '+periodLabel(period)+' 还有草稿凭证，请先全部过账再结账'); return; }
+  if (!confirm(`确认结账 ${periodLabel(period)}？结账后将生成损益结转凭证。`)) return;
 
   // Generate period-closing entry (损益结转)
   // 先移除本期已有的结转凭证，确保重新结账时余额计算正确、不会重复结转
-  DB.vouchers = DB.vouchers.filter(v => !(v.period === DB.currentPeriod && isClosingVoucher(v)));
-  const bals = calcBalances(DB.currentPeriod);
+  DB.vouchers = DB.vouchers.filter(v => !(v.period === period && isClosingVoucher(v)));
+  const bals = calcBalances(period);
   // 只结转叶子科目（无下级子科目的科目），避免父科目与子科目重复结转
   const hasChildren = (code) => DB.subjects.some(s => s.parent === code);
   const incomeSubjs = DB.subjects.filter(s=>s.type==='income' && !hasChildren(s.code));
@@ -2135,6 +2154,13 @@ function closePeriod() {
     }
   });
 
+  // Mark period as closed
+  const existing = DB.periods.find(p=>p.period===period);
+  const vCount = DB.vouchers.filter(v=>v.period===period).length;
+  if (existing) { existing.closed=true; existing.closedAt=new Date().toLocaleDateString(); existing.voucherCount=vCount; }
+  else DB.periods.push({period:period, closed:true, closedAt:new Date().toLocaleDateString(), voucherCount:vCount});
+
+  // 生成损益结转凭证（如有损益余额）
   if (incomeTotal > 0 || expenseTotal > 0) {
     const profit = rnd(incomeTotal - expenseTotal);
     const closingLines = [
@@ -2143,29 +2169,26 @@ function closePeriod() {
       {summary:'损益结转', code:'3301', debit: profit<0?rnd(Math.abs(profit)):0, credit: profit>=0?rnd(profit):0}
     ].filter(l=>l.debit!==0||l.credit!==0);
 
-    const num = genVoucherNum('转', DB.currentPeriod);
+    const num = genVoucherNum('转', period);
     DB.vouchers.push({
       id: Date.now(),
       type:'转', num,
-      date: DB.currentPeriod+'-'+new Date().getDate().toString().padStart(2,'0'),
-      period: DB.currentPeriod,
+      date: period+'-'+new Date().getDate().toString().padStart(2,'0'),
+      period: period,
       maker:'系统自动', attachment:0, status:'posted', closing:true,
       lines: closingLines
     });
   }
 
-  // Mark period as closed
-  const existing = DB.periods.find(p=>p.period===DB.currentPeriod);
-  const vCount = DB.vouchers.filter(v=>v.period===DB.currentPeriod).length;
-  if (existing) { existing.closed=true; existing.closedAt=new Date().toLocaleDateString(); existing.voucherCount=vCount; }
-  else DB.periods.push({period:DB.currentPeriod, closed:true, closedAt:new Date().toLocaleDateString(), voucherCount:vCount});
-
-  DB.currentPeriod = nextPeriod(DB.currentPeriod);
+  // 仅当用户结账的正是当前账期时，才自动推进到下一账期；结账历史期间不改变当前导航位置
+  if (period === DB.currentPeriod) DB.currentPeriod = nextPeriod(period);
   saveDB();
   updatePeriodDisplay();
-  vchrPeriod = journalPeriod = ledgerPeriod = subLedgerPeriod = balancePeriod = bsPeriod = plPeriod = cfPeriod = DB.currentPeriod;
   renderPeriodPage();
-  showToast('✅ 结账完成，已进入下一账期');
+  if (incomeTotal > 0 || expenseTotal > 0)
+    showToast('✅ '+periodLabel(period)+' 结账完成，已生成损益结转凭证'+(period===DB.currentPeriod?'，已进入下一账期':''));
+  else
+    showToast('✅ '+periodLabel(period)+' 结账完成（本期无损益余额，无需结转凭证）');
 }
 
 // 一键修复历史损益结转：删除所有结转凭证并按正确方向为各已结账月份重新生成
