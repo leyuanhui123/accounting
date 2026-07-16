@@ -492,7 +492,7 @@ async function syncCloud() {
         <div class="card">
           <div class="card-header"><span class="card-title">📋 历史账期</span></div>
           <div class="card-body" style="padding:0">
-            <table><thead><tr><th>账期</th><th>结账日期</th><th>凭证数</th><th>状态</th></tr></thead>
+            <table><thead><tr><th>账期</th><th>结账日期</th><th>凭证数</th><th>状态</th><th>操作</th></tr></thead>
             <tbody id="period-history"></tbody></table>
           </div>
         </div>
@@ -613,6 +613,7 @@ async function syncCloud() {
         <span id="bs-date-filter"></span>
         <button class="btn btn-outline btn-sm" onclick="printPage()">🖨️ 打印</button>
         <button class="btn btn-outline btn-sm" onclick="exportBS()">📥 导出</button>
+        <button class="btn btn-warning btn-sm" onclick="fixClosingVouchers()">🔧 修复历史结转</button>
       </div>
       <div class="card">
         <div class="card-header">
@@ -1672,6 +1673,7 @@ function renderVouchers() {
       <td>${v.status==='posted'?'<span class="tag tag-green">已过账</span>':'<span class="tag tag-yellow">草稿</span>'}</td>
       <td>
         <button class="btn btn-xs btn-outline" onclick="editVoucher(${v.id})">查看</button>
+        <button class="btn btn-xs btn-outline" onclick="printSingleVoucher(${v.id})">打印</button>
         ${v.status==='draft'?`<button class="btn btn-xs btn-success" onclick="postVoucher(${v.id})">过账</button>`:''}
         <button class="btn btn-xs btn-ghost" onclick="deleteVoucher(${v.id})">删</button>
       </td>
@@ -2050,13 +2052,32 @@ function renderPeriodPage() {
   // History
   const tbody = document.getElementById('period-history');
   const closed = DB.periods.filter(p=>p.closed);
-  if (!closed.length) { tbody.innerHTML = '<tr><td colspan="4" class="empty">暂无历史账期</td></tr>'; return; }
-  tbody.innerHTML = closed.map(p=>`<tr>
+  if (!closed.length) { tbody.innerHTML = '<tr><td colspan="5" class="empty">暂无历史账期</td></tr>'; return; }
+  tbody.innerHTML = closed.map(p=>{
+    // 该月是否存在系统结转凭证
+    const hasClosing = DB.vouchers.some(v=>v.period===p.period && isClosingVoucher(v));
+    return `<tr>
     <td>${periodLabel(p.period)}</td>
     <td>${p.closedAt||'—'}</td>
     <td>${p.voucherCount||0}</td>
     <td><span class="tag tag-green">已结账</span></td>
-  </tr>`).join('');
+    <td><button class="btn btn-sm btn-warning" onclick="reverseClosePeriod('${p.period}')">↩️ 冲销结账</button></td>
+  </tr>`;
+  }).join('');
+}
+
+// 判断是否为损益结转凭证（系统生成或手动录入均可识别）
+function isClosingVoucher(v) {
+  if (!v || !Array.isArray(v.lines) || !v.lines.length) return false;
+  if (v.closing === true) return true;
+  // 兼容旧版/手动结转凭证：包含“本年利润 3301”且其余行均为损益类科目（收入/成本/费用）
+  const hasRetained = v.lines.some(l => l.code === '3301');
+  if (!hasRetained) return false;
+  return v.lines.every(l => {
+    if (l.code === '3301') return true;
+    const s = getSubj(l.code);
+    return !!(s && (s.type === 'income' || s.type === 'cost' || s.type === 'expense'));
+  });
 }
 
 function closePeriod() {
@@ -2065,34 +2086,41 @@ function closePeriod() {
   if (!confirm(`确认结账 ${periodLabel(DB.currentPeriod)}？结账后将进入下一账期。`)) return;
 
   // Generate period-closing entry (损益结转)
+  // 先移除本期已有的结转凭证，确保重新结账时余额计算正确、不会重复结转
+  DB.vouchers = DB.vouchers.filter(v => !(v.period === DB.currentPeriod && isClosingVoucher(v)));
   const bals = calcBalances(DB.currentPeriod);
-  const incomeSubjs = DB.subjects.filter(s=>s.type==='income');
-  const expenseSubjs = DB.subjects.filter(s=>s.type==='expense'||s.type==='cost');
+  // 只结转叶子科目（无下级子科目的科目），避免父科目与子科目重复结转
+  const hasChildren = (code) => DB.subjects.some(s => s.parent === code);
+  const incomeSubjs = DB.subjects.filter(s=>s.type==='income' && !hasChildren(s.code));
+  const expenseSubjs = DB.subjects.filter(s=>(s.type==='expense'||s.type==='cost') && !hasChildren(s.code));
   const incomeLines = [];
   const expenseLines = [];
   let incomeTotal = 0, expenseTotal = 0;
 
+  // 辅助函数：金额保留2位小数，消除浮点精度问题
+  const rnd = x => Math.round(x * 100) / 100;
+
   incomeSubjs.forEach(s=>{
-    const bal = bals[s.code]?.closeBalance||0;
+    const bal = rnd(bals[s.code]?.closeBalance||0);
     if (Math.abs(bal) > 0.001) {
-      incomeLines.push({summary:'损益结转', code:s.code, debit:bal, credit:0});
-      incomeTotal += bal;
+      incomeLines.push({summary:'损益结转', code:s.code, debit:rnd(Math.abs(bal)), credit:0});
+      incomeTotal += rnd(Math.abs(bal));
     }
   });
   expenseSubjs.forEach(s=>{
-    const bal = bals[s.code]?.closeBalance||0;
+    const bal = rnd(bals[s.code]?.closeBalance||0);
     if (Math.abs(bal) > 0.001) {
-      expenseLines.push({summary:'损益结转', code:s.code, debit:0, credit:bal});
-      expenseTotal += bal;
+      expenseLines.push({summary:'损益结转', code:s.code, debit:0, credit:rnd(Math.abs(bal))});
+      expenseTotal += rnd(Math.abs(bal));
     }
   });
 
   if (incomeTotal > 0 || expenseTotal > 0) {
-    const profit = incomeTotal - expenseTotal;
+    const profit = rnd(incomeTotal - expenseTotal);
     const closingLines = [
       ...incomeLines,
       ...expenseLines,
-      {summary:'损益结转', code:'3301', debit: profit<0?Math.abs(profit):0, credit: profit>=0?profit:0}
+      {summary:'损益结转', code:'3301', debit: profit<0?rnd(Math.abs(profit)):0, credit: profit>=0?rnd(profit):0}
     ].filter(l=>l.debit!==0||l.credit!==0);
 
     const num = genVoucherNum('转', DB.currentPeriod);
@@ -2101,7 +2129,7 @@ function closePeriod() {
       type:'转', num,
       date: DB.currentPeriod+'-'+new Date().getDate().toString().padStart(2,'0'),
       period: DB.currentPeriod,
-      maker:'系统自动', attachment:0, status:'posted',
+      maker:'系统自动', attachment:0, status:'posted', closing:true,
       lines: closingLines
     });
   }
@@ -2118,6 +2146,68 @@ function closePeriod() {
   vchrPeriod = journalPeriod = ledgerPeriod = subLedgerPeriod = balancePeriod = bsPeriod = plPeriod = cfPeriod = DB.currentPeriod;
   renderPeriodPage();
   showToast('✅ 结账完成，已进入下一账期');
+}
+
+// 一键修复历史损益结转：删除所有结转凭证并按正确方向为各已结账月份重新生成
+function fixClosingVouchers() {
+  if (!confirm('将删除所有系统生成的损益结转凭证，并按正确方向为各已结账月份重新生成（仅结转叶子科目，金额保留2位小数）。是否继续？')) return;
+  DB.vouchers = DB.vouchers.filter(v => !isClosingVoucher(v));
+  const hasChildren = (code) => DB.subjects.some(s => s.parent === code);
+  const rnd = x => Math.round(x * 100) / 100;
+  const closedPeriods = DB.periods.filter(p => p.closed).map(p => p.period);
+  closedPeriods.forEach(period => {
+    const bals = calcBalances(period);
+    const incomeSubjs = DB.subjects.filter(s => s.type === 'income' && !hasChildren(s.code));
+    const expenseSubjs = DB.subjects.filter(s => (s.type === 'cost' || s.type === 'expense') && !hasChildren(s.code));
+    const incomeLines = [], expenseLines = [];
+    let incomeTotal = 0, expenseTotal = 0;
+    incomeSubjs.forEach(s => {
+      const bal = rnd(bals[s.code]?.closeBalance || 0);
+      if (Math.abs(bal) > 0.001) { incomeLines.push({summary:'损益结转', code:s.code, debit:rnd(Math.abs(bal)), credit:0}); incomeTotal += rnd(Math.abs(bal)); }
+    });
+    expenseSubjs.forEach(s => {
+      const bal = rnd(bals[s.code]?.closeBalance || 0);
+      if (Math.abs(bal) > 0.001) { expenseLines.push({summary:'损益结转', code:s.code, debit:0, credit:rnd(Math.abs(bal))}); expenseTotal += rnd(Math.abs(bal)); }
+    });
+    if (incomeTotal > 0 || expenseTotal > 0) {
+      const profit = rnd(incomeTotal - expenseTotal);
+      const lines = [...incomeLines, ...expenseLines,
+        {summary:'损益结转', code:'3301', debit: profit<0?rnd(Math.abs(profit)):0, credit: profit>=0?rnd(profit):0}
+      ].filter(l => l.debit !== 0 || l.credit !== 0);
+      const num = genVoucherNum('转', period);
+      DB.vouchers.push({
+        id: Date.now() + Math.floor(Math.random()*100000),
+        type:'转', num, date: period+'-28', period, maker:'系统自动',
+        attachment:0, status:'posted', closing:true, lines
+      });
+    }
+  });
+  saveDB();
+  showToast('✅ 历史损益结转已重新生成（叶子科目+2位小数），请刷新报表');
+  renderBS(); renderPL(); renderDashboard();
+}
+
+// 冲销结账：删除该月的系统结转凭证，并将该月标记为未结账，便于修改凭证后重新结账
+function reverseClosePeriod(period) {
+  const p = DB.periods.find(x => x.period === period);
+  if (!p || !p.closed) { showToast('该账期未结账，无需冲销'); return; }
+  if (!confirm(`确认冲销 ${periodLabel(period)} 的结账？\n系统将自动删除该月生成的损益结转凭证，并把该账期恢复为“未结账”状态，以便你修改凭证后重新结账。`)) return;
+
+  // 1. 删除该月所有损益结转凭证（系统生成的 closing 凭证，以及兼容识别的手动结转凭证）
+  const before = DB.vouchers.length;
+  DB.vouchers = DB.vouchers.filter(v => !(v.period === period && isClosingVoucher(v)));
+  const removed = before - DB.vouchers.length;
+
+  // 2. 标记为未结账
+  p.closed = false; p.closedAt = null; p.voucherCount = DB.vouchers.filter(v=>v.period===period).length;
+
+  // 3. 跳回该账期，方便直接修改凭证并重新结账
+  DB.currentPeriod = period;
+  saveDB();
+  updatePeriodDisplay();
+  vchrPeriod = journalPeriod = ledgerPeriod = subLedgerPeriod = balancePeriod = bsPeriod = plPeriod = cfPeriod = period;
+  renderPeriodPage();
+  showToast(`✅ 已冲销 ${periodLabel(period)} 结账，删除 ${removed} 张结转凭证，账期已恢复未结账`);
 }
 
 // ══════════════════════════════════════════════
@@ -2304,12 +2394,21 @@ function getBalCr(code, period) {
   if (subj.dir==='credit') return b.closeBalance>=0 ? b.closeBalance : 0;
   else return b.closeBalance<0 ? Math.abs(b.closeBalance) : 0;
 }
+// 资产负债表用的带符号报表金额：
+//   资产正常科目（dir=debit）为正；资产备抵科目（累计折旧/坏账准备/累计摊销，dir=credit）作减项（负）
+//   负债、权益正常科目（dir=credit）为正；反向余额以负号重分类
+function bsAmountFor(code, balsMap) {
+  const b = balsMap[code];
+  const s = getSubj(code);
+  if (!s) return b ? b.closeBalance : 0;
+  const cb = b ? b.closeBalance : 0;
+  if (s.type === 'asset') return s.dir === 'debit' ? cb : -cb;
+  return s.dir === 'credit' ? cb : -cb;
+}
+
 function sumBalByType(type, period) {
-  return DB.subjects.filter(s=>s.type===type).reduce((sum,s)=>{
-    const bals=calcBalances(period);
-    const b=bals[s.code]||{closeBalance:0};
-    return sum+b.closeBalance;
-  },0);
+  const bals = calcBalances(period);
+  return DB.subjects.filter(s=>s.type===type).reduce((sum,s)=> sum + bsAmountFor(s.code, bals), 0);
 }
 function sumBalByCodes(codes, period) {
   return codes.reduce((sum,c)=>sum+(getSubjectBalance(c,period)||0),0);
@@ -2321,22 +2420,16 @@ function renderBS() {
   const p = bsPeriod;
   const bals = calcBalances(p);
   
-  // Helper to get current period closing balance for asset-type subjects (debit-normal)
-  function balD(code) { const b = bals[code]; if(!b) return 0; const s = getSubj(code); if(!s) return b.closeBalance; return s.dir==='debit' ? Math.max(0,b.closeBalance) : Math.max(0,-b.closeBalance); }
-  // Helper for liability/equity subjects (credit-normal)
-  function balC(code) { const b = bals[code]; if(!b) return 0; const s = getSubj(code); if(!s) return b.closeBalance; return s.dir==='credit' ? Math.max(0,b.closeBalance) : Math.max(0,-b.closeBalance); }
-  // Helper for any code (absolute value)
-  function balA(code) { return Math.abs((bals[code]||{}).closeBalance||0); }
+  // 资产 / 负债 / 权益 期末余额（带符号报表金额，备抵自动作减项，亏损以负数表示）
+  function balD(code) { return bsAmountFor(code, bals); }
+  function balC(code) { return bsAmountFor(code, bals); }
+  function balA(code) { return Math.abs(bsAmountFor(code, bals)); }
   
-  // 上年年末余额 = 上一年度12月的期末余额
+  // 上年年末余额 = 上一年度12月的期末余额（同样用带符号报表金额）
   function prevYearBalance(code) {
     const [y] = p.split('-').map(Number);
     const prevBals = calcBalances((y-1)+'-12');
-    const b = prevBals[code];
-    if (!b) return 0;
-    const s = getSubj(code);
-    if (!s) return b.closeBalance;
-    return b.closeBalance;
+    return bsAmountFor(code, prevBals);
   }
   
   // 年初余额 = 本年1月期初 = 上年年末余额 (same)
@@ -2379,7 +2472,7 @@ function renderBS() {
     A('应收票据', ['1121'], 'indent-1'),
     A('应收账款', ['1122'], 'indent-1'),
     A('坏账准备', ['1131'], 'indent-1'),
-    A('应收账款净额', [], 'indent-1'),
+    A('应收账款净额', ['1122','1131'], 'indent-1'),
     A('应收款项融资', [], 'indent-1'),
     A('预付款项', ['1123'], 'indent-1'),
     A('其他应收款', ['1221'], 'indent-1'),
@@ -2389,7 +2482,7 @@ function renderBS() {
     A('其他应收款净额', [], 'indent-1'),
     A('存货', ['1402','1403','1405','1406'], 'indent-1'),
     A('存货跌价准备', ['1471'], 'indent-1'),
-    A('存货净额', [], 'indent-1'),
+    A('存货净额', ['1402','1403','1405','1406','1471'], 'indent-1'),
     A('合同资产', [], 'indent-1'),
     A('持有待售资产', [], 'indent-1'),
     A('一年内到期的非流动资产', [], 'indent-1'),
@@ -2408,7 +2501,7 @@ function renderBS() {
     A('固定资产', ['1601'], 'indent-1'),
     A('累计折旧', ['1602'], 'indent-1'),
     A('固定资产减值准备', ['1603'], 'indent-1'),
-    A('固定资产净值', [], 'indent-1'),
+    A('固定资产净值', ['1601','1602','1603'], 'indent-1'),
     A('在建工程', ['1604'], 'indent-1'),
     A('在建工程减值准备', [], 'indent-1'),
     A('在建工程净额', [], 'indent-1'),
@@ -2543,11 +2636,9 @@ function renderPL() {
     let s = getSubj(c);
     while (s && s.parent) { c = s.parent; s = getSubj(c); }
     if (!s) return 'unknown';
-    const cls = Number(s.cls) || 0;
-    if (cls >= 5000 && cls < 6000) {
-      // Check whether it's income (credit side) or cost (debit side)
-      return s.dir === 'credit' ? 'income' : 'cost';
-    }
+    // 用科目 type 字段判断：收入类→income（贷方），成本/费用类→cost（借方）
+    if (s.type === 'income') return 'income';
+    if (s.type === 'cost' || s.type === 'expense') return 'cost';
     return 'unknown';
   }
   
@@ -2558,7 +2649,7 @@ function renderPL() {
   // Sum all voucher lines matching subject code (including children) for a period
   function sumPeriod(code, period) {
     const childCodes = getChildCodes(code);
-    const vchrs = DB.vouchers.filter(v => v.period === period && v.status === 'posted');
+    const vchrs = DB.vouchers.filter(v => v.period === period && v.status === 'posted' && !isClosingVoucher(v));
     let dr = 0, cr = 0;
     vchrs.forEach(v => {
       v.lines.forEach(l => {
@@ -2624,7 +2715,8 @@ function renderPL() {
   const intInc = monthAmount('5604002'); const intIncYtd = ytdAmount('5604002');
   
   // ── 其他收益 / 投资收益 ──
-  const otherGain = monthAmount('5301');   const otherGainYtd = ytdAmount('5301');
+  // 小企业会计准则无独立“其他收益”科目，置 0（如有需要可指向具体科目）
+  const otherGain = monthAmount('5301001');   const otherGainYtd = ytdAmount('5301001');
   const investGain = monthAmount('5201');  const investGainYtd = ytdAmount('5201');
   const investAssoc = monthAmount('5201001') || 0;  const investAssocYtd = ytdAmount('5201001') || 0;
   const fvChange = monthAmount('5302');    const fvChangeYtd = ytdAmount('5302');
@@ -2637,7 +2729,7 @@ function renderPL() {
   const operProfitYtd = totalRevYtd - totalCostYtd - taxChgYtd - sellExpYtd - adminExpYtd - rdExpYtd - finExpYtd + otherGainYtd + investGainYtd + fvChangeYtd - creditLossYtd - assetLossYtd + assetDispYtd;
   
   // ── 营业外 ──
-  const nonOpIncome = monthAmount('5901');   const nonOpIncomeYtd = ytdAmount('5901');
+  const nonOpIncome = monthAmount('5301');   const nonOpIncomeYtd = ytdAmount('5301');
   const nonOpExpense = monthAmount('5902');  const nonOpExpenseYtd = ytdAmount('5902');
   
   // ── 利润总额 ──
@@ -2645,7 +2737,7 @@ function renderPL() {
   const profitBeforeTaxYtd = operProfitYtd + nonOpIncomeYtd - nonOpExpenseYtd;
   
   // ── 所得税 / 净利润 ──
-  const incomeTax = monthAmount('5801');    const incomeTaxYtd = ytdAmount('5801');
+  const incomeTax = monthAmount('5901');    const incomeTaxYtd = ytdAmount('5901');
   const netProfit = profitBeforeTax - incomeTax;
   const netProfitYtd = profitBeforeTaxYtd - incomeTaxYtd;
 
@@ -3249,6 +3341,70 @@ function updateBatchPrintBtn() {
     master.checked = checked.length === all.length;
     master.indeterminate = checked.length > 0 && checked.length < all.length;
   }
+}
+
+function printSingleVoucher(id) {
+  const v = DB.vouchers.find(x => x.id === id);
+  if (!v) { showToast('⚠️ 未找到凭证'); return; }
+  // Reuse batch print logic for a single voucher
+  const company = DB.settings.company || '企业名称';
+  const typeNames = { '记': '记账凭证', '收': '收款凭证', '付': '付款凭证', '转': '转账凭证' };
+  const typeName = typeNames[v.type] || v.type;
+  const numCN = totalCN(v);
+  let linesHtml = '';
+  let totalDr = 0, totalCr = 0;
+  v.lines.forEach(l => {
+    const dr = Number(l.debit) || 0;
+    const cr = Number(l.credit) || 0;
+    totalDr += dr; totalCr += cr;
+    const subj = DB.subjects.find(s => s.code === l.code);
+    const subjName = subj ? (subj.code + ' ' + subj.name) : (l.code || '');
+    let auxName = '';
+    if (l.customerId) {
+      const aux = DB.customers.find(c => c.id === l.customerId);
+      auxName = aux ? (aux.code + ' ' + aux.name) : '';
+    }
+    linesHtml += `<tr>
+      <td>${l.summary||''}</td>
+      <td>${subjName}</td>
+      <td>${auxName}</td>
+      <td class="td-right">${dr>0?Number(dr).toFixed(2):''}</td>
+      <td class="td-right">${cr>0?Number(cr).toFixed(2):''}</td>
+    </tr>`;
+  });
+  const html = `<div class="pv-page">
+    <div class="pv-hdr">
+      <div class="pv-company">${company}</div>
+      <div class="pv-type">${typeName}</div>
+      <div class="pv-meta">
+        <span>日期：${v.date}</span>
+        <span>字第 ${v.num} 号</span>
+        <span>附件：${(v.attachment||0)} 张</span>
+      </div>
+    </div>
+    <table class="pv-line-table">
+      <thead>
+        <tr><th style="width:26%">摘要</th><th style="width:30%">会计科目</th><th style="width:16%">辅助核算</th><th style="width:14%">借方金额</th><th style="width:14%">贷方金额</th></tr>
+      </thead>
+      <tbody>
+        ${linesHtml}
+        <tr class="pv-total-row">
+          <td>合计</td><td></td><td></td>
+          <td class="td-right">¥${Number(totalDr).toFixed(2)}</td>
+          <td class="td-right">¥${Number(totalCr).toFixed(2)}</td>
+        </tr>
+      </tbody>
+    </table>
+    <div style="font-size:11px;margin-bottom:3mm">合计（大写）：${numCN}</div>
+    <div class="pv-footer">
+      <span>制单人：${v.maker||''}</span>
+      <span>记账：</span>
+      <span>审核：</span>
+      <span>主管：</span>
+    </div>
+  </div>`;
+  document.getElementById('print-area').innerHTML = html;
+  setTimeout(() => { window.print(); }, 300);
 }
 
 function batchPrintVouchers() {
