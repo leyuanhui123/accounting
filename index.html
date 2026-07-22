@@ -2462,7 +2462,15 @@ function renderBS() {
   document.getElementById('bs-title-sub').textContent = `编制单位：${DB.settings.company||'—'}  日期：${bsPeriod}  金额单位：人民币元`;
   const p = bsPeriod;
   const bals = calcBalances(p);
-  
+
+  // 未分配利润（勾稽保障）：期初留存收益 + 利润表累计净利润
+  // 直接用利润表同一口径推导，避免依赖“结账”结转凭证对 3301 的累计（可能因漏结/重结而失真）
+  const [bsYr] = p.split('-').map(Number);
+  const bsMonth = parseInt(p.split('-')[1]);
+  const priorBals = calcBalances((bsYr - 1) + '-12');
+  const openingRetained = bsAmountFor('3301', priorBals) + bsAmountFor('3302', priorBals);
+  const undistributed = openingRetained + computeNetProfitYtd(bsYr, bsMonth);
+
   // 资产 / 负债 / 权益 期末余额（带符号报表金额，备抵自动作减项，亏损以负数表示）
   function balD(code) { return bsAmountFor(code, bals); }
   function balC(code) { return bsAmountFor(code, bals); }
@@ -2642,10 +2650,11 @@ function renderBS() {
 
   const curLiab=sumC(curLiabCodes), nonLiab=sumC(nonCurLiab), liabTotal=curLiab+nonLiab;
   const curAsset=sumD(curAssetCodes), nonAsset=sumD(nonCurAsset), assetTotal=curAsset+nonAsset;
-  const equity=sumC(equityCodes);
+  const equityCodesExcl = equityCodes.filter(c => c !== '3301' && c !== '3302');
+  const equity=sumC(equityCodesExcl) + undistributed;
   const prevCurLiab=sumCp(curLiabCodes), prevNonLiab=sumCp(nonCurLiab), prevLiabTotal=prevCurLiab+prevNonLiab;
   const prevCurAsset=sumDp(curAssetCodes), prevNonAsset=sumDp(nonCurAsset), prevAssetTotal=prevCurAsset+prevNonAsset;
-  const prevEquity=sumCp(equityCodes);
+  const prevEquity=sumCp(equityCodesExcl) + openingRetained;
 
   // 写入各小计/合计行（覆盖 AT/LT 的写死清单值，保证与明细口径一致）
   const setRow = (pred, ci, vi, cpi, vpi) => { const r = rows.find(pred); if (r) { r[ci]=fmt(vi); r[cpi]=fmt(vpi); } };
@@ -2656,6 +2665,9 @@ function renderBS() {
   setRow(r=>r[4]==='total'&&r[5]==='非流动负债合计', 6, nonLiab, 7, prevNonLiab);
   setRow(r=>r[4]==='total'&&r[5]==='负债合计', 6, liabTotal, 7, prevLiabTotal);
   setRow(r=>r[4]==='total'&&r[5]==='所有者权益（或股东权益）合计', 6, equity, 7, prevEquity);
+  // 未分配利润：用利润表累计净利润推导（与利润表勾稽一致），覆盖 L() 默认的 3301+3302 账面值
+  const urRow = rows.find(r=>r[4]==='indent-1' && r[5]==='未分配利润');
+  if (urRow) { urRow[6] = fmt(undistributed); urRow[7] = fmt(openingRetained); }
   // 负债和所有者权益（或股东权益）总计 = 资产总计（左右必然平衡）
   setRow(r=>r[4]==='total'&&r[5]==='负债和所有者权益（或股东权益）总计', 6, assetTotal, 7, prevAssetTotal);
 
@@ -2679,6 +2691,61 @@ function renderBS() {
 // ══════════════════════════════════════════════
 //  INCOME STATEMENT (利润表)
 // ══════════════════════════════════════════════
+// ══════════════════════════════════════════════
+//  利润表累计净利润：利润表与资产负债表共用，保证两表勾稽一致
+// ══════════════════════════════════════════════
+function plClassify(code) {
+  let c = code, s = getSubj(c);
+  while (s && s.parent) { c = s.parent; s = getSubj(c); }
+  if (!s) return 'unknown';
+  if (s.type === 'income') return 'income';
+  if (s.type === 'cost' || s.type === 'expense') return 'cost';
+  return 'unknown';
+}
+function plSumPeriod(code, period) {
+  const childCodes = DB.subjects.filter(s => s.parent === code).map(s => s.code);
+  const vchrs = DB.vouchers.filter(v => v.period === period && v.status === 'posted' && !isClosingVoucher(v));
+  let dr = 0, cr = 0;
+  vchrs.forEach(v => v.lines.forEach(l => {
+    if (l.code === code || childCodes.includes(l.code)) { dr += Number(l.debit) || 0; cr += Number(l.credit) || 0; }
+  }));
+  return { dr, cr };
+}
+function plMonthAmount(code, period) {
+  const { dr, cr } = plSumPeriod(code, period);
+  const cat = plClassify(code);
+  if (cat === 'income') return cr - dr;
+  if (cat === 'cost') return dr - cr;
+  return dr - cr;
+}
+function plYtdAmount(code, yr, throughMonth) {
+  let total = 0;
+  for (let m = 1; m <= throughMonth; m++) total += plMonthAmount(code, yr + '-' + String(m).padStart(2, '0'));
+  return total;
+}
+// 与利润表“四、净利润（本年累计）”口径完全一致
+function computeNetProfitYtd(yr, throughMonth) {
+  const rev = plYtdAmount('5001', yr, throughMonth) + plYtdAmount('5051', yr, throughMonth);
+  const cost = plYtdAmount('5401', yr, throughMonth) + plYtdAmount('5402', yr, throughMonth);
+  const taxChg = plYtdAmount('5601', yr, throughMonth);
+  const sell = plYtdAmount('5602', yr, throughMonth);
+  const admin = plYtdAmount('5603', yr, throughMonth);
+  const rd = plYtdAmount('5605', yr, throughMonth);
+  const fin = plYtdAmount('5604', yr, throughMonth);
+  const otherGain = plYtdAmount('5301001', yr, throughMonth);
+  const invest = plYtdAmount('5201', yr, throughMonth);
+  const fv = plYtdAmount('5302', yr, throughMonth);
+  const creditLoss = plYtdAmount('5701', yr, throughMonth);
+  const assetLoss = plYtdAmount('5702', yr, throughMonth);
+  const assetDisp = plYtdAmount('5303', yr, throughMonth);
+  const oper = rev - cost - taxChg - sell - admin - rd - fin + otherGain + invest + fv - creditLoss - assetLoss + assetDisp;
+  const nonOpInc = plYtdAmount('5301', yr, throughMonth);
+  const nonOpExp = plYtdAmount('5902', yr, throughMonth);
+  const pbt = oper + nonOpInc - nonOpExp;
+  const tax = plYtdAmount('5901', yr, throughMonth);
+  return pbt - tax;
+}
+
 function renderPL() {
   document.getElementById('pl-period-label').textContent = periodLabel(plPeriod);
   document.getElementById('pl-title-sub').textContent = `编制单位：${DB.settings.company||'—'}  日期：${plPeriod}  金额单位：人民币元`;
@@ -2795,7 +2862,8 @@ function renderPL() {
   // ── 所得税 / 净利润 ──
   const incomeTax = monthAmount('5901');    const incomeTaxYtd = ytdAmount('5901');
   const netProfit = profitBeforeTax - incomeTax;
-  const netProfitYtd = profitBeforeTaxYtd - incomeTaxYtd;
+  // 净利润（本年累计）使用与资产负债表共用的计算函数，保证两表勾稽一致
+  const netProfitYtd = computeNetProfitYtd(yr, curMonth);
 
   const plRows = [
     T('一、营业收入', totalRev, totalRevYtd),
