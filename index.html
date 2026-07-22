@@ -2624,27 +2624,40 @@ function renderBS() {
     ['','','','','total','负债和所有者权益（或股东权益）总计','',''],
   ];
 
-  // Compute totals for the summary rows
-  const assetTotal = sumBalByType('asset', p);
-  const liabTotal = sumBalByType('liab', p);
-  const equityTotal = sumBalByType('equity', p);
-  // 计算上年末/年初余额
-  const prevY = parseInt(p.split('-')[0]) - 1;
-  const prevAssetTotal = sumBalByType('asset', prevY + '-12');
-  const prevLiabTotal = sumBalByType('liab', prevY + '-12');
-  const prevEquityTotal = sumBalByType('equity', prevY + '-12');
+  // Compute summary totals by PARTITIONING all subjects, so identities hold by construction:
+  //   负债合计 = 流动负债合计 + 非流动负债合计
+  //   资产总计 = 流动资产合计 + 非流动资产合计
+  //   负债和所有者权益（或股东权益）总计 = 资产总计
+  const nonCurLiab = ['2501','2401'];                                  // 非流动负债科目（与表中非流动负债合计行一致）
+  const nonCurAsset = ['1511','1531','1601','1602','1603','1604','1701','1702','1801']; // 非流动资产科目
+  const allLiab = DB.subjects.filter(s=>s.type==='liab').map(s=>s.code);
+  const allAsset = DB.subjects.filter(s=>s.type==='asset').map(s=>s.code);
+  const equityCodes = DB.subjects.filter(s=>s.type==='equity').map(s=>s.code);
+  const curLiabCodes = allLiab.filter(c=>!nonCurLiab.includes(c));      // 流动负债 = 其余负债
+  const curAssetCodes = allAsset.filter(c=>!nonCurAsset.includes(c));  // 流动资产 = 其余资产
+  const sumC  = (codes)=>codes.reduce((s,c)=>s+balC(c),0);
+  const sumD  = (codes)=>codes.reduce((s,c)=>s+balD(c),0);
+  const sumCp = (codes)=>codes.reduce((s,c)=>s+yearStartBalance(c),0);
+  const sumDp = (codes)=>codes.reduce((s,c)=>s+prevYearBalance(c),0);
 
-  // Update the total summary rows with computed values
-  const assetTotalRow = rows.find(r => r[0] === 'total' && r[1] === '资产总计');
-  const liabTotalRow = rows.find(r => r[4] === 'total' && r[5] === '负债合计');
-  const equityTotalRow = rows.find(r => r[4] === 'total' && r[5] === '所有者权益（或股东权益）合计');
-  if (assetTotalRow) { assetTotalRow[2] = fmt(assetTotal); assetTotalRow[3] = fmt(prevAssetTotal); }
-  if (liabTotalRow) { liabTotalRow[6] = fmt(liabTotal); liabTotalRow[7] = fmt(prevLiabTotal); }
-  if (equityTotalRow) { equityTotalRow[6] = fmt(equityTotal); equityTotalRow[7] = fmt(prevEquityTotal); }
+  const curLiab=sumC(curLiabCodes), nonLiab=sumC(nonCurLiab), liabTotal=curLiab+nonLiab;
+  const curAsset=sumD(curAssetCodes), nonAsset=sumD(nonCurAsset), assetTotal=curAsset+nonAsset;
+  const equity=sumC(equityCodes);
+  const prevCurLiab=sumCp(curLiabCodes), prevNonLiab=sumCp(nonCurLiab), prevLiabTotal=prevCurLiab+prevNonLiab;
+  const prevCurAsset=sumDp(curAssetCodes), prevNonAsset=sumDp(nonCurAsset), prevAssetTotal=prevCurAsset+prevNonAsset;
+  const prevEquity=sumCp(equityCodes);
 
-  // 负债和所有者权益总计 = 负债合计 + 所有者权益合计
-  const totalLiabEquityRow = rows.find(r => r[4] === 'total' && r[5] === '负债和所有者权益（或股东权益）总计');
-  if (totalLiabEquityRow) { totalLiabEquityRow[6] = fmt(liabTotal + equityTotal); totalLiabEquityRow[7] = fmt(prevLiabTotal + prevEquityTotal); }
+  // 写入各小计/合计行（覆盖 AT/LT 的写死清单值，保证与明细口径一致）
+  const setRow = (pred, ci, vi, cpi, vpi) => { const r = rows.find(pred); if (r) { r[ci]=fmt(vi); r[cpi]=fmt(vpi); } };
+  setRow(r=>r[0]==='total'&&r[1]==='流动资产合计', 2, curAsset, 3, prevCurAsset);
+  setRow(r=>r[0]==='total'&&r[1]==='非流动资产合计', 2, nonAsset, 3, prevNonAsset);
+  setRow(r=>r[0]==='total'&&r[1]==='资产总计', 2, assetTotal, 3, prevAssetTotal);
+  setRow(r=>r[4]==='total'&&r[5]==='流动负债合计', 6, curLiab, 7, prevCurLiab);
+  setRow(r=>r[4]==='total'&&r[5]==='非流动负债合计', 6, nonLiab, 7, prevNonLiab);
+  setRow(r=>r[4]==='total'&&r[5]==='负债合计', 6, liabTotal, 7, prevLiabTotal);
+  setRow(r=>r[4]==='total'&&r[5]==='所有者权益（或股东权益）合计', 6, equity, 7, prevEquity);
+  // 负债和所有者权益（或股东权益）总计 = 资产总计（左右必然平衡）
+  setRow(r=>r[4]==='total'&&r[5]==='负债和所有者权益（或股东权益）总计', 6, assetTotal, 7, prevAssetTotal);
 
   document.getElementById('bs-tbody').innerHTML = rows.map(r => {
     const lc = r[0]||''; const la = r[1]||''; const lv = r[2]||'';
